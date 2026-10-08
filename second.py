@@ -1,7 +1,8 @@
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
 # Your existing RAG imports
@@ -23,106 +24,51 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# ==========================================
-# STEP 2: CREATE FASTAPI APP
-# ==========================================
+def build_rag_pipeline():
+    pdf_path = Path(__file__).resolve().parent / "data" / "CAREER_counsellor.pdf"
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF not found at: {pdf_path}")
 
-app = FastAPI()
+    raw_documents = PyPDFLoader(str(pdf_path)).load()
+    print(f"Successfully loaded {len(raw_documents)} pages from PDF.", flush=True)
 
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+    )
+    split_docs = text_splitter.split_documents(raw_documents)
+    print(f"Created {len(split_docs)} chunks.", flush=True)
 
-# ==========================================
-# STEP 3: LOAD PDF
-# ==========================================
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    vector_database = Chroma.from_documents(split_docs, embeddings)
+    llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.2)
 
-loader = PyPDFLoader("data/CAREER_counsellor.pdf")
-
-raw_documents = loader.load()
-
-print(f"Successfully loaded {len(raw_documents)} pages from PDF.")
-
-
-# ==========================================
-# STEP 4: SPLIT DOCUMENT
-# ==========================================
-
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200
-)
-
-split_docs = text_splitter.split_documents(raw_documents)
-
-print(f"Created {len(split_docs)} chunks.")
-
-
-# ==========================================
-# STEP 5: CREATE EMBEDDINGS + CHROMA
-# ==========================================
-
-embeddings = HuggingFaceEmbeddings(
-    model_name="all-MiniLM-L6-v2"
-)
-
-vector_database = Chroma.from_documents(
-    split_docs,
-    embeddings
-)
+    system_instruction = (
+        "You are a helpful assistant. Use the provided context below to answer "
+        "the user's question. If you don't know the answer based on the context, "
+        "honestly say that you don't know. Do not make things up.\n\n"
+        "Context:\n{context}"
+    )
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", system_instruction),
+        ("human", "{input}"),
+    ])
+    retriever = vector_database.as_retriever(search_kwargs={"k": 3})
+    document_chain = create_stuff_documents_chain(llm, prompt_template)
+    return create_retrieval_chain(retriever, document_chain)
 
 
-# ==========================================
-# STEP 6: CREATE GROQ LLM
-# ==========================================
-
-llm = ChatGroq(
-    model="openai/gpt-oss-20b",
-    temperature=0.2
-)
-
-
-# ==========================================
-# STEP 7: CREATE PROMPT
-# ==========================================
-
-system_instruction = (
-    "You are a helpful assistant. Use the provided context below to answer "
-    "the user's question. If you don't know the answer based on the context, "
-    "honestly say that you don't know. Do not make things up.\n\n"
-    "Context:\n{context}"
-)
-
-prompt_template = ChatPromptTemplate.from_messages([
-    ("system", system_instruction),
-    ("human", "{input}")
-])
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not os.getenv("GROQ_API_KEY"):
+        raise RuntimeError(
+            "GROQ_API_KEY is missing. Add it to your environment or Render dashboard."
+        )
+    app.state.rag_pipeline = build_rag_pipeline()
+    yield
 
 
-# ==========================================
-# STEP 8: CREATE RETRIEVER
-# ==========================================
-
-retriever = vector_database.as_retriever(
-    search_kwargs={"k": 3}
-)
-
-
-# ==========================================
-# STEP 9: CREATE DOCUMENT CHAIN
-# ==========================================
-
-document_chain = create_stuff_documents_chain(
-    llm,
-    prompt_template
-)
-
-
-# ==========================================
-# STEP 10: CREATE RAG PIPELINE
-# ==========================================
-
-rag_pipeline = create_retrieval_chain(
-    retriever,
-    document_chain
-)
+app = FastAPI(lifespan=lifespan)
 
 
 # ==========================================
@@ -131,11 +77,6 @@ rag_pipeline = create_retrieval_chain(
 
 class ChatRequest(BaseModel):
     question: str
-
-
-# Optional: fail early with a clear error if Groq key is missing
-if not os.getenv("GROQ_API_KEY"):
-    raise RuntimeError("GROQ_API_KEY is missing. Add it to your environment or Render dashboard.")
 
 
 # ==========================================
@@ -154,9 +95,8 @@ def home():
 # ==========================================
 
 @app.post("/chat")
-def chat(request: ChatRequest):
-
-    result = rag_pipeline.invoke({
+def chat(request: ChatRequest, http_request: Request):
+    result = http_request.app.state.rag_pipeline.invoke({
         "input": request.question
     })
 
@@ -166,4 +106,3 @@ def chat(request: ChatRequest):
         "question": request.question,
         "answer": answer
     }
-
