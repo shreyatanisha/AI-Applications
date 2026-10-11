@@ -8,5 +8,5 @@ langchain-text-splitters==0.3.8
 pypdf==6.19.0
 sentence-transformers==6.1.0
 fastapi
-uvicorn[standard]
+uvicorn
 python-dotenv
